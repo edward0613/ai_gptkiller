@@ -1,4 +1,4 @@
-# ai_gptkiller
+# image_gptkiller
 classifies ai-made images from real images\
 used CIFAKE as train dataset\
 used google colab to train
