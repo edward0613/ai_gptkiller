@@ -1,0 +1,215 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
+
+
+# 1. Dataset Definition
+class EmotionDataset(Dataset):
+    """
+    Dataset for emotion classification.
+    Expects a DataFrame with columns:
+      - 'content': the text
+      - 'sentiment': the emotion label (as text)
+    Converts labels into one-hot vectors.
+    """
+    def __init__(self, data: pd.DataFrame, tokenizer: AutoTokenizer, max_length: int, label2id: dict):
+        self.data = data.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.label2id = label2id
+        self.num_labels = len(label2id)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx: int):
+        #content = self.data.loc[idx, 'content']
+        #label_text = self.data.loc[idx, 'sentiment']
+        content = self.data.loc[idx, 'Text']
+        label_text = self.data.loc[idx, 'Emotion']
+        label_id = self.label2id[label_text]
+        target = torch.zeros(self.num_labels, dtype=torch.float)
+        target[label_id] = 1.0
+
+        encoding = self.tokenizer.encode_plus(
+            content,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+            'label': target
+        }
+
+# 2. Attention Pooling Layer
+class AttentionPooling(nn.Module):
+    """
+    Applies a learned attention mechanism over token embeddings.
+    Given a sequence of hidden states and an attention mask, computes
+    attention scores (ignoring padded tokens) and returns a weighted sum.
+    """
+    def __init__(self, hidden_size: int):
+        super(AttentionPooling, self).__init__()
+        self.attention = nn.Linear(hidden_size, 1)
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor):
+        scores = self.attention(hidden_states).squeeze(-1)
+        scores = scores.masked_fill(attention_mask == 0, -1e9)
+        attn_weights = torch.softmax(scores, dim=1)
+        pooled_output = torch.sum(hidden_states * attn_weights.unsqueeze(-1), dim=1)
+        return pooled_output, attn_weights
+
+# 3. Model with Pretrained Transformer and Attention
+class EmotionClassifierWithAttention(nn.Module):
+    """
+    Uses a pretrained transformer to encode input text and then applies an
+    attention pooling mechanism before classification.
+    """
+    def __init__(self, transformer_model_name: str, num_labels: int, dropout_rate: float = 0.4):
+        super(EmotionClassifierWithAttention, self).__init__()
+        self.transformer = AutoModel.from_pretrained(transformer_model_name)
+        hidden_size = self.transformer.config.hidden_size
+        self.attention_pool = AttentionPooling(hidden_size)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_size, num_labels)
+        )
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+        outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
+        last_hidden_state = outputs.last_hidden_state
+        pooled_output, attn_weights = self.attention_pool(last_hidden_state, attention_mask)
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+        return logits, attn_weights
+
+# 4. Training and Evaluation Functions
+def train_epoch(model, data_loader, loss_fn, optimizer, device, scheduler, clip_value=1.0):
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    global count
+    for batch in data_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
+        optimizer.zero_grad()
+        logits, _ = model(input_ids, attention_mask)
+        loss = loss_fn(logits, labels)
+        if count%50==0: print(loss.item())
+        count+=1
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+        optimizer.step()
+        scheduler.step()
+        total_loss += loss.item()
+        preds = torch.argmax(logits, dim=1)
+        true_labels = torch.argmax(labels, dim=1)
+        correct += (preds == true_labels).sum().item()
+        total += labels.size(0)
+    return correct / total, total_loss / len(data_loader)
+
+def eval_model(model, data_loader, loss_fn, device):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+            logits, _ = model(input_ids, attention_mask)
+            loss = loss_fn(logits, labels)
+            total_loss += loss.item()
+            preds = torch.argmax(logits, dim=1)
+            true_labels = torch.argmax(labels, dim=1)
+            correct += (preds == true_labels).sum().item()
+            total += labels.size(0)
+    return correct / total, total_loss / len(data_loader)
+
+# 5. Helper Function for Consistent Logging
+def log_epoch_metrics(epoch, epochs, train_loss, train_acc, val_loss, val_acc):
+    message = (f"Epoch {epoch}/{epochs} | "
+               f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+               f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+    print(message)
+''' wandb.log({
+        "epoch": epoch,
+        "train_loss": train_loss,
+        "train_accuracy": train_acc,
+        "val_loss": val_loss,
+        "val_accuracy": val_acc,
+    })'''
+
+# 6. Top-Level Training Script
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+transformer_model_name = "bert-base-uncased"
+max_length = 128
+batch_size = 32
+epochs = 5
+learning_rate = 2e-5
+
+
+
+merge_map={'happy':'positive','love':'positive','surprise':'positive','sadness':'negative','anger':'negative','fear':'negative'}
+df = pd.read_csv("Emotion_final.csv")
+df['Emotion'] = df['Emotion'].replace(merge_map)
+sample_sizes ={'positive':6000,'negative':6000}
+dfw = [
+    df[df['Emotion'] == emotion].sample(n=sample_sizes[emotion], random_state=42)
+    for emotion in sample_sizes
+]
+dfnew = pd.concat(dfw)
+unique_emotions = sorted(df['Emotion'].unique())
+label2id = {label: i for i, label in enumerate(unique_emotions)}
+id2label = {i: label for label, i in label2id.items()}
+
+df_train, df_val = train_test_split(dfnew, test_size=0.1, random_state=42, stratify=dfnew['Emotion'])
+
+tokenizer = AutoTokenizer.from_pretrained(transformer_model_name)
+train_dataset = EmotionDataset(df_train, tokenizer, max_length, label2id)
+val_dataset = EmotionDataset(df_val, tokenizer, max_length, label2id)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size,num_workers=2)
+
+num_labels = len(unique_emotions)
+model = EmotionClassifierWithAttention(transformer_model_name, num_labels)
+model = model.to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,weight_decay=0.01)
+total_steps = len(train_loader) * epochs
+scheduler = get_linear_schedule_with_warmup(
+    optimizer, num_warmup_steps=int(0.2 * total_steps), num_training_steps=total_steps
+)
+loss_fn = nn.BCEWithLogitsLoss()
+
+best_val_acc = 0.0
+best_model_path = "attention_first_model"
+count=0
+for epoch in range(1, epochs + 1):
+    train_acc, train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device, scheduler)
+    val_acc, val_loss = eval_model(model, val_loader, loss_fn, device)
+
+    log_epoch_metrics(epoch, epochs, train_loss, train_acc, val_loss, val_acc)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), best_model_path)
+        print(f"=> New best model saved with Val Acc: {best_val_acc:.4f}")
